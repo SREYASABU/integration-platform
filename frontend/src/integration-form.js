@@ -7,8 +7,7 @@ import {
 import { AirtableIntegration } from './integrations/airtable';
 import { NotionIntegration } from './integrations/notion';
 import { HubSpotIntegration } from './integrations/hubspot';  
-import { DataForm } from './data-form';
-
+import { DataForm } from './data-form';;
 const integrationMapping = {
     'Notion': NotionIntegration,
     'Airtable': AirtableIntegration,
@@ -57,7 +56,7 @@ export const IntegrationForm = () => {
             }
             {integrationParams?.credentials && 
                 <Box sx={{mt: 2}}>
-                    <DataForm 
+                    <DataForm
                         integrationType={integrationParams?.type} 
                         credentials={integrationParams?.credentials} 
                     />
