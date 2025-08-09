@@ -12,7 +12,7 @@ import { DataForm } from './data-form';
 const integrationMapping = {
     'Notion': NotionIntegration,
     'Airtable': AirtableIntegration,
-    'HubSpot': HubSpotIntegration,
+    'HubSpot': HubSpotIntegration,  // Added HubSpot
 };
 
 export const IntegrationForm = () => {
