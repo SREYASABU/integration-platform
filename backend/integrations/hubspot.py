@@ -1,289 +1,205 @@
-# hubspot.py (snippets)
 import os
 import time
 import json
-import uuid
-import requests
-from urllib.parse import quote_plus
-from typing import List, Dict, Any, Optional
-from fastapi import Request
-from fastapi.responses import RedirectResponse, JSONResponse
+import urllib.parse
+import httpx
+from fastapi import Request, HTTPException
+from fastapi.responses import HTMLResponse
+import redis
+from dotenv import load_dotenv
+load_dotenv()
 
-# --- config (read from env)
-HUBSPOT_CLIENT_ID = os.environ.get("HUBSPOT_CLIENT_ID")
-HUBSPOT_CLIENT_SECRET = os.environ.get("HUBSPOT_CLIENT_SECRET")
-HUBSPOT_REDIRECT_URI = os.environ.get("HUBSPOT_REDIRECT_URI", "http://localhost:8000/integrations/hubspot/oauth2callback")
-
-# default scopes used during install (space-separated)
-HUBSPOT_SCOPES = "crm.objects.contacts.read crm.objects.companies.read crm.objects.deals.read"
-
-# HubSpot endpoints
-HUBSPOT_AUTHORIZE_URL = "https://app.hubspot.com/oauth/authorize"
-HUBSPOT_TOKEN_URL = "https://api.hubapi.com/oauth/v1/token"
+# HubSpot OAuth and API endpoints
+HUBSPOT_OAUTH_AUTHORIZE_URL = "https://app.hubspot.com/oauth/authorize"
+HUBSPOT_OAUTH_TOKEN_URL = "https://api.hubapi.com/oauth/v1/token"
 HUBSPOT_API_BASE = "https://api.hubapi.com"
 
-# Redis key prefixes
-REDIS_PREFIX = "integration:hubspot:"
+# Config from environment
+HUBSPOT_CLIENT_ID = os.getenv("HUBSPOT_CLIENT_ID")
+HUBSPOT_CLIENT_SECRET = os.getenv("HUBSPOT_CLIENT_SECRET")
+HUBSPOT_REDIRECT_URI = os.getenv("HUBSPOT_REDIRECT_URI", "http://localhost:8000/integrations/hubspot/oauth2callback")
 
+HUBSPOT_SCOPES = [
+    "crm.objects.companies.read",
+    "crm.objects.contacts.read",
+    "crm.objects.deals.read",
+    "oauth"
+]
 
-# --- Helper to get a redis client from request, or create one (adapt to your app)
-def _get_redis_client(request: Request):
-    """
-    If your app attaches a redis client to request.state.redis, use that.
-    Otherwise this will create a local redis.StrictRedis client using REDIS_URL env var.
-    """
-    try:
-        redis_client = request.state.redis  # expected in many FastAPI apps
-        return redis_client
-    except Exception:
-        import redis
-        REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-        return redis.from_url(REDIS_URL)
+# Redis client
+redis_url = os.getenv("REDIS_URL")
+if redis_url:
+    _redis = redis.from_url(redis_url, decode_responses=True)
+else:
+    _redis = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        db=int(os.getenv("REDIS_DB", 0)),
+        decode_responses=True
+    )
 
+def _redis_key(user_id, org_id):
+    return f"hubspot:tokens:{user_id}:{org_id}"
 
-# --- IntegrationItem fallback
-# If your repo defines an IntegrationItem dataclass, import it instead of using this fallback.
-try:
-    from ..models import IntegrationItem  # adapt this import if your project differs
-except Exception:
-    from dataclasses import dataclass
-    @dataclass
-    class IntegrationItem:
-        id: str
-        title: str
-        type: str
-        parameters: Dict[str, Any]
-
-
-# 1) authorize_hubspot(request) -> RedirectResponse
-def authorize_hubspot(request: Request):
-    """
-    Build the HubSpot authorize URL, store a short-lived state token in redis, and redirect.
-    Endpoint pattern expected in repo: GET /integrations/hubspot/authorize
-    """
-    if not HUBSPOT_CLIENT_ID:
-        return JSONResponse({"error": "HUBSPOT_CLIENT_ID not configured"}, status_code=500)
-
-    state = str(uuid.uuid4())
-    redis_client = _get_redis_client(request)
-    # store state for 5 minutes
-    try:
-        redis_client.set(f"{REDIS_PREFIX}state:{state}", "1", ex=300)
-    except Exception:
-        # if redis is not available, still proceed but you lose state protection
-        pass
-
+async def authorize_hubspot(user_id, org_id):
+    state = urllib.parse.quote(f"{user_id}:{org_id}", safe="")
+    scope_str = " ".join(HUBSPOT_SCOPES)
     params = {
         "client_id": HUBSPOT_CLIENT_ID,
         "redirect_uri": HUBSPOT_REDIRECT_URI,
-        "scope": HUBSPOT_SCOPES,
+        "scope": scope_str,
         "state": state,
     }
-    # Build URL (safe encoding)
-    q = "&".join(f"{k}={quote_plus(v)}" for k, v in params.items())
-    url = f"{HUBSPOT_AUTHORIZE_URL}?{q}"
-    return RedirectResponse(url)
+    query = urllib.parse.urlencode(params)
+    return f"{HUBSPOT_OAUTH_AUTHORIZE_URL}?{query}"
 
-
-# 2) oauth2callback_hubspot(request) -> RedirectResponse / JSON
-def oauth2callback_hubspot(request: Request):
-    """
-    Called by HubSpot after user authorizes.
-    Exchanges the code for access + refresh tokens and persists them in redis.
-    You may choose to redirect to frontend with a short success page.
-    """
+async def oauth2callback_hubspot(request: Request):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
 
     if error:
-        return JSONResponse({"error": "hubspot_authorization_failed", "details": error}, status_code=400)
+        raise HTTPException(status_code=400, detail=f"HubSpot OAuth error: {error}")
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
 
-    if not code:
-        return JSONResponse({"error": "missing_code"}, status_code=400)
+    user_id, org_id = urllib.parse.unquote(state).split(":", 1)
 
-    redis_client = _get_redis_client(request)
-    # optional: verify state value in redis if present
-    try:
-        if state:
-            st = redis_client.get(f"{REDIS_PREFIX}state:{state}")
-            # allow missing as a non-fatal case
-    except Exception:
-        pass
-
-    # Exchange code for tokens
-    data = {
-        "grant_type": "authorization_code",
-        "client_id": HUBSPOT_CLIENT_ID,
-        "client_secret": HUBSPOT_CLIENT_SECRET,
-        "redirect_uri": HUBSPOT_REDIRECT_URI,
-        "code": code,
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    resp = requests.post(HUBSPOT_TOKEN_URL, data=data, headers=headers)
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            HUBSPOT_OAUTH_TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": HUBSPOT_CLIENT_ID,
+                "client_secret": HUBSPOT_CLIENT_SECRET,
+                "redirect_uri": HUBSPOT_REDIRECT_URI,
+                "code": code,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
     if resp.status_code != 200:
-        return JSONResponse({"error": "token_exchange_failed", "details": resp.text}, status_code=500)
-    token_payload = resp.json()
-    # token_payload includes: access_token, refresh_token, expires_in, hub_domain, etc.
-    access_token = token_payload.get("access_token")
-    refresh_token = token_payload.get("refresh_token")
-    expires_in = token_payload.get("expires_in", 0)
-    hub_domain = token_payload.get("hub_domain", "unknown")
+        raise HTTPException(status_code=400, detail=f"Token exchange failed: {resp.text}")
+    token_data = resp.json()
 
-    # store tokens in redis keyed by hub_domain (or some installation id). Adapt to your storage model.
-    key = f"{REDIS_PREFIX}tokens:{hub_domain}"
-    saved = {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_at": int(time.time()) + int(expires_in or 0),
-        "hub_domain": hub_domain,
-        "scope": token_payload.get("scope"),
+    key = _redis_key(user_id, org_id)
+    rec = {
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token"),
+        "expires_in": token_data.get("expires_in"),
+        "obtained_at": int(time.time()),
+        "raw": json.dumps(token_data),
     }
-    try:
-        redis_client.set(key, json.dumps(saved))
-    except Exception as e:
-        # fallback: return the tokens (not secure) — prefer redis
-        return JSONResponse({"warning": "redis_save_failed", "tokens": saved, "error": str(e)}, status_code=500)
+    _redis.hmset(key, rec)
+    if token_data.get("expires_in"):
+        _redis.expire(key, int(token_data["expires_in"]) + 300)
 
-    # Redirect back to frontend (optional) with success message
-    frontend = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
-    return RedirectResponse(f"{frontend}/?integrations=hubspot_connected")
-
-
-# 3) get_hubspot_credentials(request, hub_domain) -> dict with access_token (refreshes if needed)
-def get_hubspot_credentials(request: Request, hub_domain: Optional[str] = None) -> Dict[str, Any]:
+    # Return HTML that closes the window
+    close_window_script = """
+    <html>
+        <script>
+            window.close();
+        </script>
+        <body>
+            <p>Authentication successful! You can close this window if it doesn't close automatically.</p>
+        </body>
+    </html>
     """
-    Load saved tokens from redis for hub_domain (or the first saved installation if hub_domain is None).
-    If access_token is expired (or near expiry), automatically refresh it using HubSpot's token endpoint.
-    Returns a dict with at least access_token and hub_domain.
-    """
-    redis_client = _get_redis_client(request)
+    return HTMLResponse(content=close_window_script)
 
-    # If hub_domain not provided, pick the first saved key
-    if not hub_domain:
-        # naive: scan keys
+async def get_hubspot_credentials(user_id, org_id):
+    key = _redis_key(user_id, org_id)
+    if not _redis.exists(key):
+        return None
+    rec = _redis.hgetall(key)
+    access = rec.get("access_token")
+    expires_in = rec.get("expires_in")
+    obtained = rec.get("obtained_at")
+    if access and expires_in and obtained:
         try:
-            keys = redis_client.keys(f"{REDIS_PREFIX}tokens:*")
-            if not keys:
-                raise Exception("no hubspot tokens found")
-            key = keys[0] if isinstance(keys[0], bytes) else keys[0]
-            hub_domain = key.decode().split(":")[-1] if isinstance(key, bytes) else key.split(":")[-1]
-        except Exception as e:
-            raise RuntimeError("No stored HubSpot credentials: " + str(e))
+            if time.time() > (int(obtained) + int(expires_in) - 60):
+                rec = await _refresh_token(user_id, org_id, rec.get("refresh_token"))
+        except Exception:
+            rec = await _refresh_token(user_id, org_id, rec.get("refresh_token"))
+    return rec
 
-    key = f"{REDIS_PREFIX}tokens:{hub_domain}"
-    raw = redis_client.get(key)
-    if not raw:
-        raise RuntimeError("No tokens for hub_domain: " + str(hub_domain))
-    tokens = json.loads(raw if isinstance(raw, str) else raw.decode())
+async def _refresh_token(user_id, org_id, refresh_token):
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            HUBSPOT_OAUTH_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": HUBSPOT_CLIENT_ID,
+                "client_secret": HUBSPOT_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Refresh token failed: {resp.text}")
+    token_data = resp.json()
 
-    # If token expired or will within 60 seconds, refresh
-    if tokens.get("expires_at", 0) - time.time() < 60:
-        # refresh
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": HUBSPOT_CLIENT_ID,
-            "client_secret": HUBSPOT_CLIENT_SECRET,
-            "refresh_token": tokens.get("refresh_token"),
+    key = _redis_key(user_id, org_id)
+    rec = {
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token", refresh_token),
+        "expires_in": token_data.get("expires_in"),
+        "obtained_at": int(time.time()),
+        "raw": json.dumps(token_data),
+    }
+    _redis.hmset(key, rec)
+    if token_data.get("expires_in"):
+        _redis.expire(key, int(token_data["expires_in"]) + 300)
+    return rec
+
+async def create_integration_item_metadata_object(response_json):
+    obj_id = response_json.get("id")
+    props = response_json.get("properties", {})
+    # infer type
+    if "dealname" in props:
+        obj_type = "deal"
+        title = props.get("dealname") or f"Deal {obj_id}"
+        params = {"amount": props.get("amount"), "dealstage": props.get("dealstage")}
+    elif "firstname" in props or "lastname" in props:
+        obj_type = "contact"
+        title = " ".join(p for p in [props.get("firstname"), props.get("lastname")] if p) or props.get("email") or f"Contact {obj_id}"
+        params = {
+            "email": props.get("email"),
+            "first_name": props.get("firstname"),
+            "last_name": props.get("lastname"),
+            "company": props.get("company"),
         }
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        r = requests.post(HUBSPOT_TOKEN_URL, data=data, headers=headers)
-        if r.status_code != 200:
-            raise RuntimeError("Failed refreshing token: " + r.text)
-        new = r.json()
-        tokens["access_token"] = new.get("access_token")
-        tokens["refresh_token"] = new.get("refresh_token", tokens.get("refresh_token"))
-        tokens["expires_at"] = int(time.time()) + int(new.get("expires_in", 0))
-        tokens["scope"] = new.get("scope", tokens.get("scope"))
-        # persist updated tokens
-        redis_client.set(key, json.dumps(tokens))
-    return tokens
+    elif "name" in props or "domain" in props:
+        obj_type = "company"
+        title = props.get("name") or props.get("domain") or f"Company {obj_id}"
+        params = {"name": props.get("name"), "domain": props.get("domain")}
+    else:
+        obj_type = "unknown"
+        title = props.get("name") or f"Item {obj_id}"
+        params = props
+    return {"id": obj_id, "title": title, "type": obj_type, "parameters": params}
 
+async def get_items_hubspot(credentials):
+    access = credentials.get("access_token")
+    if not access:
+        raise HTTPException(status_code=400, detail="Missing access_token")
 
-# 4) get_items_hubspot(request, hub_domain) -> List[IntegrationItem]
-def get_items_hubspot(request: Request, hub_domain: Optional[str] = None) -> List[IntegrationItem]:
-    """
-    Query HubSpot CRM endpoints (contacts, companies, deals) and return a list of IntegrationItem objects.
-    This example returns up to 50 contacts/companies/deals each and maps basic properties.
-    """
-    tokens = get_hubspot_credentials(request, hub_domain)
-    access_token = tokens["access_token"]
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {access}", "Content-Type": "application/json"}
+    items = []
 
-    items: List[IntegrationItem] = []
-
-    # Helper to call object list endpoint
-    def fetch_objects(obj: str, properties: str = "") -> List[Dict[str, Any]]:
-        url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{obj}"
-        params = {"limit": 50}
-        if properties:
-            params["properties"] = properties
-        r = requests.get(url, headers=headers, params=params)
-        r.raise_for_status()
-        j = r.json()
-        return j.get("results", [])
-
-    # Contacts
-    try:
-        contacts = fetch_objects("contacts", "email,firstname,lastname,phone")
-        for c in contacts:
-            props = c.get("properties", {})
-            title = props.get("email") or f"{props.get('firstname','')} {props.get('lastname','')}".strip()
-            item = IntegrationItem(
-                id=f"contact:{c.get('id')}",
-                title=title,
-                type="contact",
-                parameters={
-                    "hubspot_id": c.get("id"),
-                    "email": props.get("email"),
-                    "firstname": props.get("firstname"),
-                    "lastname": props.get("lastname"),
-                    "phone": props.get("phone"),
-                },
-            )
-            items.append(item)
-    except Exception as e:
-        # non-fatal; continue with companies/deals
-        print("Error fetching contacts:", e)
-
-    # Companies
-    try:
-        companies = fetch_objects("companies", "name,domain,phone")
-        for comp in companies:
-            props = comp.get("properties", {})
-            item = IntegrationItem(
-                id=f"company:{comp.get('id')}",
-                title=props.get("name") or props.get("domain") or f"Company {comp.get('id')}",
-                type="company",
-                parameters={
-                    "hubspot_id": comp.get("id"),
-                    "name": props.get("name"),
-                    "domain": props.get("domain"),
-                    "phone": props.get("phone"),
-                },
-            )
-            items.append(item)
-    except Exception as e:
-        print("Error fetching companies:", e)
-
-    # Deals
-    try:
-        deals = fetch_objects("deals", "dealname,amount,dealstage,closedate")
-        for d in deals:
-            props = d.get("properties", {})
-            item = IntegrationItem(
-                id=f"deal:{d.get('id')}",
-                title=props.get("dealname") or f"Deal {d.get('id')}",
-                type="deal",
-                parameters={
-                    "hubspot_id": d.get("id"),
-                    "dealname": props.get("dealname"),
-                    "amount": props.get("amount"),
-                    "dealstage": props.get("dealstage"),
-                },
-            )
-            items.append(item)
-    except Exception as e:
-        print("Error fetching deals:", e)
+    async with httpx.AsyncClient() as client:
+        for obj_type, props in [
+            ("contacts", "firstname,lastname,email,company"),
+            ("companies", "name,domain"),
+            ("deals", "dealname,amount,dealstage"),
+        ]:
+            url = f"{HUBSPOT_API_BASE}/crm/v3/objects/{obj_type}"
+            resp = await client.get(url, headers=headers, params={"limit": 50, "properties": props})
+            if resp.status_code != 200:
+                # skip on failure
+                continue
+            data = resp.json()
+            for obj in data.get("results", []):
+                meta = await create_integration_item_metadata_object(obj)
+                items.append(meta)
 
     return items
