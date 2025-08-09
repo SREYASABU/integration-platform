@@ -64,7 +64,7 @@ async def get_notion_items(credentials: str = Form(...)):
 async def authorize_hubspot_integration(user_id: str = Form(...), org_id: str = Form(...)):
     return await authorize_hubspot(user_id, org_id)
 
-@app.get('/integrations/hubspot/oauth2callback')
+@app.get('/hubspot/oauth2callback')
 async def oauth2callback_hubspot_integration(request: Request):
     return await oauth2callback_hubspot(request)
 
